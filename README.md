@@ -89,8 +89,11 @@ MAKEFUN_OUTPUT_DIR=out python3 main.py   # writes out/entry.png
 ```
 
 With `MAKEFUN_OUTPUT_DIR` unset or set to an empty string it writes to
-`/output/entry.png`. The program uses no network and writes the same
-bytes on every run.
+`/output/entry.png`. The copy is made by the program itself rather than
+by an external tool: it counts the bytes as they are written, rejects
+the run if fewer bytes land than the source holds, and only then reads
+the delivered file back for the sha256 comparison. The program uses no
+network and writes the same bytes on every run.
 
 ## Design iterations
 

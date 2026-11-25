@@ -1,140 +1,164 @@
 #!/usr/bin/env python3
-"""news-image-20261125 entry point.
+"""Deliver the finished front-page image for news-image-20261125.
 
-The repository ships a finished front-page image as ``entry.png`` (JPEG
-bytes under a .png name, which the contest rules allow). This program
-checks that image against the contest limits — a whole PNG or JPEG, at
-most 1 MiB, at most 1024x1024 pixels — and then copies it unchanged to
-``entry.png`` in the output directory:
+The picture itself ships in this directory as ``entry.png``.  What this
+program adds is a guard rail: before anything is delivered it proves
+that the shipped file is a complete image the contest will accept, and
+afterwards it proves the delivered copy is the very same bytes.
 
     mkdir -p out
-    MAKEFUN_OUTPUT_DIR=out python3 main.py    # writes out/entry.png
+    MAKEFUN_OUTPUT_DIR=out python3 main.py
 
-With MAKEFUN_OUTPUT_DIR unset, or set to an empty string, the output
-directory is /output (an empty value counts as unset).
-
-Standard library only, no network. The output is a byte-for-byte copy of
-the shipped image, so every run writes exactly the same bytes.
+``MAKEFUN_OUTPUT_DIR`` picks the destination directory; when it is
+missing or empty the destination is ``/output``.  Only the Python
+standard library is used and nothing here touches the network, so the
+delivered file is identical on every run.
 """
 
 import hashlib
 import os
-import shutil
 import struct
 import sys
 import zlib
 
-LIMIT_BYTES = 1024 * 1024
-LIMIT_SIDE = 1024
+MAX_FILE_BYTES = 1024 * 1024   # contest cap: 1 MiB
+MAX_EDGE = 1024                # contest cap: 1024 px per side
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_SOI = b"\xff\xd8"
+JPEG_EOI = b"\xff\xd9"
+
+# JPEG markers that carry no payload and no length field.
+_JPEG_BARE = {0x01, 0xD8} | set(range(0xD0, 0xD8))
+# Start-of-frame markers whose segment holds the picture dimensions.
+_JPEG_SOF = {0xC0, 0xC1, 0xC2}
 
 
-def die(message):
-    print(f"main.py: error: {message}", file=sys.stderr)
-    raise SystemExit(1)
+class Reject(Exception):
+    """The shipped image failed a check; the run must stop."""
 
 
-def jpeg_size(data):
-    """(width, height) of a JPEG, or None if data does not start as one.
+def jpeg_dimensions(blob):
+    """Return (width, height) if blob is a JPEG, else None.
 
-    Walks marker segments from the SOI marker to the first start-of-frame
-    segment. The file must end with the EOI marker.
+    A blob that starts like a JPEG but is malformed raises Reject: a
+    truncated or corrupt file must fail loudly, not fall through to
+    some other interpretation.
     """
-    if len(data) < 4 or data[:2] != b"\xff\xd8":
+    if len(blob) < 4 or not blob.startswith(JPEG_SOI):
         return None
-    if data[-2:] != b"\xff\xd9":
-        die("JPEG does not end with the end-of-image marker")
-    pos = 2
-    while pos + 4 <= len(data):
-        if data[pos] != 0xFF:
-            die(f"JPEG: marker expected at offset {pos}")
-        marker = data[pos + 1]
-        if marker == 0xD9:  # EOI before any frame header
-            break
-        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
-            pos += 2  # standalone markers carry no length field
+    if not blob.endswith(JPEG_EOI):
+        raise Reject("JPEG is missing its end-of-image marker")
+    cursor = 2
+    while cursor + 1 < len(blob):
+        if blob[cursor] != 0xFF:
+            raise Reject(f"JPEG marker missing at byte {cursor}")
+        marker = blob[cursor + 1]
+        if marker == 0xD9:
+            break  # reached EOI without ever seeing a frame header
+        if marker in _JPEG_BARE:
+            cursor += 2
             continue
-        (seg_len,) = struct.unpack(">H", data[pos + 2:pos + 4])
-        if seg_len < 2 or pos + 2 + seg_len > len(data):
-            die("JPEG: segment runs past the end of the file")
-        if marker in (0xC0, 0xC1, 0xC2):  # SOF0, SOF1, SOF2
-            height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
+        if cursor + 4 > len(blob):
+            raise Reject("JPEG segment header runs past the file end")
+        (span,) = struct.unpack_from(">H", blob, cursor + 2)
+        if span < 2 or cursor + 2 + span > len(blob):
+            raise Reject("JPEG segment length runs past the file end")
+        if marker in _JPEG_SOF:
+            height, width = struct.unpack_from(">HH", blob, cursor + 5)
             return width, height
-        pos += 2 + seg_len
-    die("JPEG: no start-of-frame segment found")
+        cursor += 2 + span
+    raise Reject("JPEG contains no start-of-frame segment")
 
 
-def png_size(data):
-    """(width, height) of a PNG, or None if data does not start as one.
+def png_dimensions(blob):
+    """Return (width, height) if blob is a PNG, else None.
 
-    Every chunk's CRC is verified; IHDR must be present and IEND must be
-    the final chunk with nothing after it.
+    The chunk list is walked end to end: each chunk's stored CRC must
+    match a fresh CRC over its type and data, the first chunk must be
+    IHDR, and IEND must finish exactly at the end of the file.
     """
-    if len(data) < 8 or data[:8] != b"\x89PNG\r\n\x1a\n":
+    if len(blob) < 8 or not blob.startswith(PNG_MAGIC):
         return None
-    pos = 8
-    size = None
-    seen_iend = False
-    while pos + 12 <= len(data):
-        (length,) = struct.unpack(">I", data[pos:pos + 4])
-        ctype = data[pos + 4:pos + 8]
-        end = pos + 12 + length
-        if end > len(data):
-            die("PNG: chunk runs past the end of the file")
-        body = data[pos + 8:pos + 8 + length]
-        (crc_seen,) = struct.unpack(">I", data[pos + 8 + length:end])
-        crc_real = zlib.crc32(body, zlib.crc32(ctype)) & 0xFFFFFFFF
-        if crc_real != crc_seen:
-            die(f"PNG: CRC mismatch in {ctype!r} chunk")
-        if ctype == b"IHDR":
-            if length != 13:
-                die("PNG: IHDR chunk has the wrong length")
-            size = struct.unpack(">II", body[:8])
-        elif ctype == b"IEND":
-            seen_iend = True
-            if end != len(data):
-                die("PNG: bytes follow the IEND chunk")
-            break
-        pos = end
-    if size is None:
-        die("PNG: no IHDR chunk")
-    if not seen_iend:
-        die("PNG: no IEND chunk")
-    return size
+    cursor = len(PNG_MAGIC)
+    dimensions = None
+    first = True
+    while cursor < len(blob):
+        if cursor + 8 > len(blob):
+            raise Reject("PNG chunk header runs past the file end")
+        (payload_len,) = struct.unpack_from(">I", blob, cursor)
+        kind = blob[cursor + 4:cursor + 8]
+        chunk_end = cursor + 12 + payload_len
+        if chunk_end > len(blob):
+            raise Reject(f"PNG {kind!r} chunk runs past the file end")
+        payload = blob[cursor + 8:cursor + 8 + payload_len]
+        (stored_crc,) = struct.unpack_from(">I", blob, cursor + 8 + payload_len)
+        actual_crc = zlib.crc32(payload, zlib.crc32(kind)) & 0xFFFFFFFF
+        if actual_crc != stored_crc:
+            raise Reject(f"PNG {kind!r} chunk has a bad CRC")
+        if first and kind != b"IHDR":
+            raise Reject("PNG does not begin with an IHDR chunk")
+        first = False
+        if kind == b"IHDR":
+            if payload_len != 13:
+                raise Reject("PNG IHDR chunk is not 13 bytes")
+            dimensions = struct.unpack_from(">II", payload, 0)
+        elif kind == b"IEND":
+            if chunk_end != len(blob):
+                raise Reject("trailing bytes after the PNG IEND chunk")
+            if dimensions is None:
+                raise Reject("PNG has an IEND but no IHDR")
+            return dimensions
+        cursor = chunk_end
+    raise Reject("PNG ends without an IEND chunk")
 
 
-def main():
-    here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, "entry.png")
-    if not os.path.isfile(src):
-        die(f"shipped image not found: {src}")
-    with open(src, "rb") as fh:
-        data = fh.read()
-    if len(data) > LIMIT_BYTES:
-        die(f"image is {len(data)} bytes, over the 1 MiB limit")
-    dims = jpeg_size(data)
-    kind = "JPEG"
-    if dims is None:
-        dims = png_size(data)
-        kind = "PNG"
-    if dims is None:
-        die("entry.png is neither a whole JPEG nor a whole PNG")
-    width, height = dims
-    if width > LIMIT_SIDE or height > LIMIT_SIDE:
-        die(f"image is {width}x{height}, over the 1024x1024 limit")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
-    dst = os.path.join(out_dir, "entry.png")
-    digest = hashlib.sha256(data).hexdigest()
-    shutil.copyfile(src, dst)
-    # Read the copy back and check it: a short or corrupted write (full
-    # disk, interrupted copy) must fail the run, not pass silently.
-    with open(dst, "rb") as fh:
-        written = fh.read()
-    if len(written) != len(data) or hashlib.sha256(written).hexdigest() != digest:
-        die(f"written file {dst} does not match the shipped image")
-    print(f"main.py: wrote {dst} ({kind} {width}x{height}, "
-          f"{len(data)} bytes, sha256 {digest})")
+def inspect_image(blob):
+    """Identify the image format and return (format, width, height)."""
+    for probe in (jpeg_dimensions, png_dimensions):
+        found = probe(blob)
+        if found is not None:
+            name = "JPEG" if probe is jpeg_dimensions else "PNG"
+            return name, found[0], found[1]
+    raise Reject("entry.png is neither a complete JPEG nor a complete PNG")
+
+
+def run():
+    base = os.path.dirname(os.path.abspath(__file__))
+    source = os.path.join(base, "entry.png")
+    if not os.path.isfile(source):
+        raise Reject(f"shipped image is missing: {source}")
+    with open(source, "rb") as fh:
+        blob = fh.read()
+    if len(blob) > MAX_FILE_BYTES:
+        raise Reject(f"image weighs {len(blob)} bytes; the cap is {MAX_FILE_BYTES}")
+    fmt, width, height = inspect_image(blob)
+    if width > MAX_EDGE or height > MAX_EDGE:
+        raise Reject(f"image measures {width}x{height}; the cap is {MAX_EDGE}x{MAX_EDGE}")
+
+    target_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    os.makedirs(target_dir, exist_ok=True)
+    target = os.path.join(target_dir, "entry.png")
+    expected = hashlib.sha256(blob).hexdigest()
+    with open(target, "wb") as fh:
+        written_count = fh.write(blob)
+    if written_count != len(blob):
+        raise Reject(f"short write to {target}: "
+                     f"{written_count} of {len(blob)} bytes landed")
+    # Read the delivered file back: a short write or a flipped byte on
+    # disk must turn into a failed run, never into a silent bad entry.
+    with open(target, "rb") as fh:
+        delivered = fh.read()
+    if delivered != blob or hashlib.sha256(delivered).hexdigest() != expected:
+        raise Reject(f"delivered file {target} differs from the shipped image")
+    print(f"delivered {target}: {fmt} {width}x{height}, "
+          f"{len(blob)} bytes, sha256 {expected}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(run())
+    except Reject as problem:
+        print(f"main.py: {problem}", file=sys.stderr)
+        sys.exit(1)
